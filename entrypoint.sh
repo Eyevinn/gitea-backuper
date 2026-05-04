@@ -26,6 +26,18 @@ configure_mc() {
   mc alias set s3store "${S3_ENDPOINT}" "${S3_ACCESS_KEY}" "${S3_SECRET_KEY}" --quiet
 }
 
+# Returns true when the S3 target is MinIO (i.e. not AWS S3)
+is_minio() {
+  [[ "${S3_ENDPOINT:-}" != *"amazonaws.com"* ]]
+}
+
+# Auto-create the bucket on MinIO; for AWS S3 the bucket is assumed to be pre-created
+ensure_bucket_exists() {
+  if is_minio; then
+    mc mb --ignore-existing "s3store/${S3_BUCKET}" 2>&1 || true
+  fi
+}
+
 backup() {
   echo "Starting Gitea backup..."
 
@@ -103,6 +115,7 @@ backup() {
   # Upload to S3
   echo "Uploading to s3store/${S3_BUCKET}/${S3_OBJECT_KEY}..."
   configure_mc
+  ensure_bucket_exists
   mc cp "${BACKUP_FILE}" "s3store/${S3_BUCKET}/${S3_OBJECT_KEY}"
 
   echo "Backup completed: ${S3_OBJECT_KEY}"
