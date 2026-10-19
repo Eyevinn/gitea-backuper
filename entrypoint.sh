@@ -22,13 +22,67 @@ REPOS_DIR="/tmp/repos"
 META_DIR="/tmp/meta"
 
 # Configure mc alias
+# --api S3v4 makes "alias set" a local config write; without it mc probes the
+# server and aborts the job (set -e) when the endpoint still answers 503.
 configure_mc() {
-  mc alias set s3store "${S3_ENDPOINT}" "${S3_ACCESS_KEY}" "${S3_SECRET_KEY}" --quiet
+  mc alias set s3store "${S3_ENDPOINT}" "${S3_ACCESS_KEY}" "${S3_SECRET_KEY}" --api S3v4 --quiet
+  wait_for_s3
 }
 
 # Returns true when the S3 target is MinIO (i.e. not AWS S3)
 is_minio() {
   [[ "${S3_ENDPOINT:-}" != *"amazonaws.com"* ]]
+}
+
+# Wait until the S3 endpoint answers an authenticated request.
+# Always returns 0: on timeout or rejected credentials the real transfer decides the outcome.
+wait_for_s3() {
+  if ! is_minio; then
+    return 0
+  fi
+  local timeout="${S3_READY_TIMEOUT_SECONDS:-300}"
+  local interval="${S3_READY_INTERVAL_SECONDS:-5}"
+  local start=$SECONDS out
+  echo "Waiting for S3 endpoint ${S3_ENDPOINT} ..."
+  while true; do
+    if out=$(mc --json ls s3store/ 2>&1); then
+      echo "S3 endpoint ready after $((SECONDS - start))s"
+      return 0
+    fi
+    if printf '%s' "$out" | grep -Eq 'AccessDenied|InvalidAccessKeyId|SignatureDoesNotMatch'; then
+      echo "WARN: S3 endpoint rejected the credentials, not waiting" >&2
+      return 0
+    fi
+    if [ $((SECONDS - start)) -ge "$timeout" ]; then
+      echo "WARN: S3 endpoint not ready after $((SECONDS - start))s, proceeding" >&2
+      return 0
+    fi
+    sleep "$interval"
+  done
+}
+
+# mc cp with up to 3 attempts (back-off 5s, 15s). Credential errors and missing
+# objects are not retried. Returns mc's last status after the final failure.
+mc_cp_with_retry() {
+  local src="$1" dst="$2" out rc=0 attempt
+  local no_retry_re='Access Denied|Access Key Id you provided does not exist|signature we calculated does not match|Object does not exist'
+  for attempt in 1 2 3; do
+    case "$attempt" in
+      2) sleep 5 ;;
+      3) sleep 15 ;;
+    esac
+    if out=$(mc cp "$src" "$dst" 2>&1); then
+      return 0
+    else
+      rc=$?
+    fi
+    printf '%s\n' "$out" >&2
+    if printf '%s' "$out" | grep -Eqi "$no_retry_re"; then
+      break
+    fi
+    echo "WARN: mc cp attempt ${attempt}/3 failed" >&2
+  done
+  return "$rc"
 }
 
 # Auto-create the bucket on MinIO; for AWS S3 the bucket is assumed to be pre-created
@@ -116,7 +170,7 @@ backup() {
   echo "Uploading to s3store/${S3_BUCKET}/${S3_OBJECT_KEY}..."
   configure_mc
   ensure_bucket_exists
-  mc cp "${BACKUP_FILE}" "s3store/${S3_BUCKET}/${S3_OBJECT_KEY}"
+  mc_cp_with_retry "${BACKUP_FILE}" "s3store/${S3_BUCKET}/${S3_OBJECT_KEY}"
 
   echo "Backup completed: ${S3_OBJECT_KEY}"
 }
@@ -128,7 +182,7 @@ restore() {
 
   # Download from S3
   echo "Downloading from s3store/${S3_BUCKET}/${S3_OBJECT_KEY}..."
-  mc cp "s3store/${S3_BUCKET}/${S3_OBJECT_KEY}" "${BACKUP_FILE}"
+  mc_cp_with_retry "s3store/${S3_BUCKET}/${S3_OBJECT_KEY}" "${BACKUP_FILE}"
 
   # Decrypt if key provided
   if [ -n "${ENCRYPTION_KEY:-}" ]; then
