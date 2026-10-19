@@ -24,6 +24,10 @@ OSC runner image for backing up and restoring tenant Gitea instances on [Open So
 | `S3_ACCESS_KEY` | Yes | MinIO/S3 access key |
 | `S3_SECRET_KEY` | Yes | MinIO/S3 secret key |
 | `ENCRYPTION_KEY` | No | AES-256-CBC passphrase for encrypting/decrypting the backup archive. If omitted, the archive is stored unencrypted. Must match between backup and restore runs. |
+| `S3_READY_TIMEOUT_SECONDS` | No | Max seconds to wait for the S3 endpoint to answer before the transfer (default `300`). Skipped for `amazonaws.com` endpoints. On timeout the job proceeds and the transfer decides the outcome. |
+| `S3_READY_INTERVAL_SECONDS` | No | Seconds between readiness probes (default `5`). |
+
+Before every backup/restore transfer the job waits for the S3 endpoint, and `mc cp` is retried up to 3 times (5 s, then 15 s back-off; credential errors and missing objects are not retried).
 
 ## Usage on OSC
 
@@ -69,6 +73,14 @@ docker run --rm \
   ...
   gitea-backuper
 ```
+
+## Running the tests
+
+```bash
+bash tests/run.sh
+```
+
+Requires bash, tar, gzip and jq. `mc`, `curl`, `git` and `sleep` are stubbed.
 
 ## Encryption
 
