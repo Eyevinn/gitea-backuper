@@ -97,6 +97,16 @@ When `ENCRYPTION_KEY` is set, the backup archive is encrypted with AES-256-CBC u
 - The built-in `oscadmin` user is skipped during user restore.
 - Org repositories are created under their original organisation; user repositories fall back to the `oscadmin` user if the owner org/user does not exist yet.
 
+## Failure text
+
+The OSC console shows the last `ERROR:` line of the restore job log, except the generic `ERROR: Restore finished with failures`, which is skipped when a more specific line exists. Every failure path therefore has to print one `ERROR:` line:
+
+- Failures with their own handler (user create, repo probe, repo create, mirror push) print a specific `ERROR:` line.
+- Any other failing command during `OPERATION=restore` (an `ERR` trap in `entrypoint.sh`) prints exactly one `ERROR: restore failed during <step>` line to stderr, where `<step>` is `configure S3`, `download`, `decrypt`, `extract`, `users` or `repositories`, and the job exits with that command's own status. The line never contains the failing command, since the push URL carries the Gitea token.
+- The trap prints nothing when an `ERROR:` line was already printed.
+
+A new failure path in `restore()` must print one `ERROR:` line through `restore_error`, or be covered by a `RESTORE_STEP`. `tests/restore-errors.test.sh` covers these paths.
+
 ## License
 
 MIT License — see [LICENSE](LICENSE).

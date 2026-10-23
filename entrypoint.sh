@@ -202,21 +202,45 @@ decide_repo_action() {
       ACTION=skip
     fi
   else
-    echo "ERROR: cannot probe ${owner}/${repo} (HTTP ${code:-000})"
+    restore_error "cannot probe ${owner}/${repo} (HTTP ${code:-000})"
   fi
   rm -f "$body"
+}
+
+# Print an explicit ERROR line and remember it, so the ERR trap stays silent.
+restore_error() {
+  echo "ERROR: $*"
+  RESTORE_ERROR_PRINTED=1
+}
+
+# ERR trap for OPERATION=restore: a failure that has no handler of its own gets
+# exactly one fixed-class line. It never prints the failing command (the push
+# URL contains GITEA_TOKEN) and keeps the failing command's exit status.
+RESTORE_STEP="start"
+RESTORE_ERROR_PRINTED=0
+restore_err_trap() {
+  local rc=$?
+  # Subshells ($(...)) inherit the trap; only the main shell reports.
+  if [ "$BASHPID" = "$MAIN_PID" ] && [ "$RESTORE_ERROR_PRINTED" -eq 0 ]; then
+    RESTORE_ERROR_PRINTED=1
+    echo "ERROR: restore failed during ${RESTORE_STEP}" >&2
+  fi
+  exit "$rc"
 }
 
 restore() {
   echo "Starting Gitea restore..."
 
+  RESTORE_STEP="configure S3"
   configure_mc
 
   # Download from S3
+  RESTORE_STEP="download"
   echo "Downloading from s3store/${S3_BUCKET}/${S3_OBJECT_KEY}..."
   mc_cp_with_retry "s3store/${S3_BUCKET}/${S3_OBJECT_KEY}" "${BACKUP_FILE}"
 
   # Decrypt if key provided
+  RESTORE_STEP="decrypt"
   if [ -n "${ENCRYPTION_KEY:-}" ]; then
     echo "Decrypting backup..."
     openssl enc -d -aes-256-cbc -salt -pbkdf2 -k "${ENCRYPTION_KEY}" \
@@ -225,6 +249,7 @@ restore() {
   fi
 
   # Extract archive
+  RESTORE_STEP="extract"
   echo "Extracting archive..."
   tar -xzf "${BACKUP_FILE}" -C /tmp
 
@@ -235,6 +260,7 @@ restore() {
   failed_count=0
 
   # Recreate users
+  RESTORE_STEP="users"
   if [ -f "${META_DIR}/users.json" ]; then
     echo "Recreating users..."
     user_count=$(jq 'length' "${META_DIR}/users.json")
@@ -276,13 +302,14 @@ restore() {
       if [ "$http_code" = "422" ] || [ "$http_code" = "409" ]; then
         echo "User ${username} already exists, skipping"
       elif [ "$http_code" != "201" ]; then
-        echo "ERROR: Failed to create user ${username} (HTTP ${http_code})"
+        restore_error "Failed to create user ${username} (HTTP ${http_code})"
         restore_failed=1
       fi
     done
   fi
 
   # Restore repos from mirrors
+  RESTORE_STEP="repositories"
   echo "Restoring repositories..."
   while read -r mirror_path; do
     # Path format: /tmp/repos/owner/repo.git
@@ -330,11 +357,11 @@ restore() {
         # Created by someone else after our probe: decide again on the real state.
         decide_repo_action "${owner}" "${repo}"
         if [ "$ACTION" = "create" ]; then
-          echo "ERROR: ${owner}/${repo}: create returned 409 but the repo is still missing"
+          restore_error "${owner}/${repo}: create returned 409 but the repo is still missing"
           ACTION=fail
         fi
       elif [ "$http_code" != "201" ]; then
-        echo "ERROR: ${owner}/${repo}: failed to create repo (HTTP ${http_code})"
+        restore_error "${owner}/${repo}: failed to create repo (HTTP ${http_code})"
         ACTION=fail
       fi
     fi
@@ -360,7 +387,7 @@ restore() {
         created_count=$((created_count + 1))
       fi
     else
-      echo "ERROR: ${owner}/${repo}: failed to push mirror"
+      restore_error "${owner}/${repo}: failed to push mirror"
       failed_count=$((failed_count + 1))
       restore_failed=1
     fi
@@ -369,7 +396,7 @@ restore() {
   echo "Restore summary: created=${created_count} skipped=${skipped_count} overwritten=${overwritten_count} failed=${failed_count}"
 
   if [ "$restore_failed" -ne 0 ]; then
-    echo "ERROR: Restore finished with failures"
+    restore_error "Restore finished with failures"
     return 1
   fi
 
@@ -381,6 +408,9 @@ case "${OPERATION}" in
     backup
     ;;
   restore)
+    MAIN_PID=$BASHPID
+    set -E
+    trap restore_err_trap ERR
     restore
     ;;
   *)
