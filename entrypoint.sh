@@ -307,6 +307,14 @@ restore() {
     # overwritten unless RESTORE_OVERWRITE_EXISTING=true.
     decide_repo_action "${owner}" "${repo}"
     if [ "$ACTION" = "create" ]; then
+      # Visibility comes from the backup metadata; anything unreadable means private.
+      meta_file="${REPOS_DIR}/${owner}/${repo}.meta.json"
+      repo_private=$(jq -r 'if (.private | type) == "boolean" then (.private | tostring) else "invalid" end' \
+        "${meta_file}" 2>/dev/null || true)
+      if [ "$repo_private" != "true" ] && [ "$repo_private" != "false" ]; then
+        echo "WARN: no visibility metadata for ${owner}/${repo}, creating it private"
+        repo_private=true
+      fi
       http_code=$(curl -s -o /dev/null -w "%{http_code}" \
         -X POST \
         -H "Authorization: Bearer ${GITEA_TOKEN}" \
@@ -315,7 +323,7 @@ restore() {
         -d "{
           \"name\": \"${repo}\",
           \"auto_init\": false,
-          \"private\": false
+          \"private\": ${repo_private}
         }" || true)
 
       if [ "$http_code" = "409" ]; then
