@@ -62,6 +62,7 @@ case "$method $url" in
   "GET "*/api/v1/users/oscadmin) [ "$OSCADMIN_EXISTS" = 1 ] && code=200 || code=404 ;;
   "GET "*/api/v1/orgs/acme) code=200 ;;
   "GET "*/api/v1/orgs/*) code=404 ;;
+  "GET "*/api/v1/repos/*) code=404 ;;
   "POST "*) [ -n "$CREATE_FAIL_MATCH" ] && case "$url" in *"$CREATE_FAIL_MATCH"*) code=500 ;; esac ;;
 esac
 [ "$wflag" = 1 ] && printf '%s' "$code"
