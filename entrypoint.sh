@@ -196,6 +196,8 @@ restore() {
   echo "Extracting archive..."
   tar -xzf "${BACKUP_FILE}" -C /tmp
 
+  restore_failed=0
+
   # Recreate users
   if [ -f "${META_DIR}/users.json" ]; then
     echo "Recreating users..."
@@ -205,9 +207,17 @@ restore() {
       email=$(jq -r ".[$i].email" "${META_DIR}/users.json")
       full_name=$(jq -r ".[$i].full_name // \"\"" "${META_DIR}/users.json")
 
+      # The built-in user is only skipped when it already exists on the target.
+      # A target whose admin has another name lacks it, and every
+      # platform-created repo is owned by it.
       if [ "$username" = "oscadmin" ]; then
-        echo "Skipping built-in user: ${username}"
-        continue
+        exists_code=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Authorization: Bearer ${GITEA_TOKEN}" \
+          "${GITEA_URL}/api/v1/users/${username}")
+        if [ "$exists_code" = "200" ]; then
+          echo "Skipping built-in user: ${username}"
+          continue
+        fi
       fi
 
       echo "Creating user: ${username}"
@@ -230,15 +240,15 @@ restore() {
       if [ "$http_code" = "422" ] || [ "$http_code" = "409" ]; then
         echo "User ${username} already exists, skipping"
       elif [ "$http_code" != "201" ]; then
-        echo "WARNING: Failed to create user ${username} (HTTP ${http_code}), skipping"
+        echo "ERROR: Failed to create user ${username} (HTTP ${http_code})"
+        restore_failed=1
       fi
     done
   fi
 
   # Restore repos from mirrors
   echo "Restoring repositories..."
-  find "${REPOS_DIR}" -name "*.git" -type d | while read -r mirror_path; do
-    # Derive owner and repo name from path
+  while read -r mirror_path; do
     # Path format: /tmp/repos/owner/repo.git
     relative="${mirror_path#${REPOS_DIR}/}"
     owner=$(dirname "$relative")
@@ -246,47 +256,48 @@ restore() {
 
     echo "Restoring repo: ${owner}/${repo}"
 
-    # Determine if this is an org repo or user repo
-    # Try to create under the owner; fall back to current user
+    # Create the repo for its owner, never under the token owner.
+    # Org owners use the org endpoint, user owners the admin endpoint.
+    org_code=$(curl -s -o /dev/null -w "%{http_code}" \
+      -H "Authorization: Bearer ${GITEA_TOKEN}" \
+      "${GITEA_URL}/api/v1/orgs/${owner}")
+    if [ "$org_code" = "200" ]; then
+      create_url="${GITEA_URL}/api/v1/org/${owner}/repos"
+    else
+      create_url="${GITEA_URL}/api/v1/admin/users/${owner}/repos"
+    fi
+
     http_code=$(curl -s -o /dev/null -w "%{http_code}" \
       -X POST \
       -H "Authorization: Bearer ${GITEA_TOKEN}" \
       -H "Content-Type: application/json" \
-      "${GITEA_URL}/api/v1/org/${owner}/repos" \
+      "${create_url}" \
       -d "{
         \"name\": \"${repo}\",
         \"auto_init\": false,
         \"private\": false
       }")
 
-    if [ "$http_code" = "404" ]; then
-      # org not found, try user endpoint
-      http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-        -X POST \
-        -H "Authorization: Bearer ${GITEA_TOKEN}" \
-        -H "Content-Type: application/json" \
-        "${GITEA_URL}/api/v1/user/repos" \
-        -d "{
-          \"name\": \"${repo}\",
-          \"auto_init\": false,
-          \"private\": false
-        }")
-    fi
-
     if [ "$http_code" = "409" ] || [ "$http_code" = "422" ]; then
       echo "Repo ${owner}/${repo} already exists, pushing anyway"
     elif [ "$http_code" != "201" ]; then
-      echo "WARNING: Failed to create repo ${owner}/${repo} (HTTP ${http_code})"
+      echo "ERROR: ${owner}/${repo}: failed to create repo (HTTP ${http_code})"
+      restore_failed=1
+      continue
     fi
 
     # Push mirror
-    (
-      cd "${mirror_path}"
-      git push --mirror \
-        "https://oscadmin:${GITEA_TOKEN}@${GITEA_HOST}/${owner}/${repo}.git" \
-        2>&1 || echo "WARNING: Failed to push mirror for ${owner}/${repo}"
-    )
-  done
+    if ! git -C "${mirror_path}" push --mirror \
+      "https://oscadmin:${GITEA_TOKEN}@${GITEA_HOST}/${owner}/${repo}.git" 2>&1; then
+      echo "ERROR: ${owner}/${repo}: failed to push mirror"
+      restore_failed=1
+    fi
+  done < <(find "${REPOS_DIR}" -name "*.git" -type d)
+
+  if [ "$restore_failed" -ne 0 ]; then
+    echo "ERROR: Restore finished with failures"
+    return 1
+  fi
 
   echo "Restore completed"
 }
